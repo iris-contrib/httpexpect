@@ -1,6 +1,6 @@
 module github.com/iris-contrib/httpexpect/v2
 
-go 1.21
+go 1.20
 
 require (
 	github.com/ajg/form v1.5.1
