@@ -1,0 +1,4 @@
+# Force LF everywhere. Without this, a Windows checkout under core.autocrlf=true
+# gives gofmt a CRLF tree and `gofmt -l .` reports every file in the repo.
+* text=auto eol=lf
+*.png binary

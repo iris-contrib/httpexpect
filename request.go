@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"mime/multipart"
 	"net"
 	"net/http"
@@ -15,6 +14,7 @@ import (
 	"os"
 	"reflect"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -38,6 +38,7 @@ type Request struct {
 	maxRedirects   int
 
 	retryPolicy   RetryPolicy
+	retryPolicyFn func(*http.Response, error) bool
 	maxRetries    int
 	minRetryDelay time.Duration
 	maxRetryDelay time.Duration
@@ -47,10 +48,12 @@ type Request struct {
 
 	httpReq *http.Request
 	path    string
-	query   url.Values
+
+	query        url.Values
+	queryEncoder QueryEncoder
 
 	form        url.Values
-	formbuf     *bytes.Buffer
+	formBuf     *bytes.Buffer
 	multipart   *multipart.Writer
 	multipartFn func(w io.Writer) *multipart.Writer
 
@@ -121,13 +124,18 @@ func newRequest(
 		redirectPolicy: defaultRedirectPolicy,
 		maxRedirects:   -1,
 
-		retryPolicy:   RetryTimeoutAndServerErrors,
+		retryPolicy:   defaultRetryPolicy,
+		retryPolicyFn: nil,
 		maxRetries:    0,
 		minRetryDelay: time.Millisecond * 50,
 		maxRetryDelay: time.Second * 5,
 		sleepFn: func(d time.Duration) <-chan time.Time {
 			return time.After(d)
 		},
+
+		query:        nil,
+		queryEncoder: defaultQueryEncoder,
+
 		multipartFn: func(w io.Writer) *multipart.Writer {
 			return multipart.NewWriter(w)
 		},
@@ -702,8 +710,11 @@ func (r *Request) WithMaxRedirects(maxRedirects int) *Request {
 type RetryPolicy int
 
 const (
+	// indicates that WithRetryPolicy was not called
+	defaultRetryPolicy RetryPolicy = iota
+
 	// DontRetry disables retrying at all.
-	DontRetry RetryPolicy = iota
+	DontRetry
 
 	// Deprecated: use RetryTimeoutErrors instead.
 	RetryTemporaryNetworkErrors
@@ -756,7 +767,63 @@ func (r *Request) WithRetryPolicy(policy RetryPolicy) *Request {
 		return r
 	}
 
+	if r.retryPolicyFn != nil {
+		opChain.fail(AssertionFailure{
+			Type: AssertUsage,
+			Errors: []error{
+				fmt.Errorf("unexpected call:" +
+					" WithRetryPolicy() and WithRetryPolicyFunc() are mutually exclusive"),
+			},
+		})
+		return r
+	}
+
 	r.retryPolicy = policy
+
+	return r
+}
+
+// WithRetryPolicyFunc sets a function to replace built-in policies
+// with user-defined policy.
+//
+// The function expects you to return true to perform a retry. And false to
+// not perform a retry.
+//
+// Example:
+//
+//	req := NewRequestC(config, "POST", "/path")
+//	req.WithRetryPolicyFunc(func(res *http.Response, err error) bool {
+//		return resp.StatusCode == http.StatusTeapot
+//	})
+func (r *Request) WithRetryPolicyFunc(
+	fn func(res *http.Response, err error) bool,
+) *Request {
+	opChain := r.chain.enter("WithRetryPolicyFunc()")
+	defer opChain.leave()
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if opChain.failed() {
+		return r
+	}
+
+	if !r.checkOrder(opChain, "WithRetryPolicyFunc()") {
+		return r
+	}
+
+	if r.retryPolicy != defaultRetryPolicy {
+		opChain.fail(AssertionFailure{
+			Type: AssertUsage,
+			Errors: []error{
+				fmt.Errorf("unexpected call:" +
+					" WithRetryPolicy() and WithRetryPolicyFunc() are mutually exclusive"),
+			},
+		})
+		return r
+	}
+
+	r.retryPolicyFn = fn
 
 	return r
 }
@@ -1050,7 +1117,13 @@ func (r *Request) withPath(opChain *chain, key string, value interface{}) {
 					},
 				})
 			} else {
-				mustWrite(w, fmt.Sprint(value))
+				switch value.(type) {
+				case float64, float32:
+					v := value.(float64)
+					mustWrite(w, strconv.FormatFloat(v, 'f', -1, 64))
+				default:
+					mustWrite(w, fmt.Sprint(value))
+				}
 				found = true
 			}
 		} else {
@@ -1137,6 +1210,9 @@ func (r *Request) WithQuery(key string, value interface{}) *Request {
 // Various object types are supported. Structs may contain "url" struct tag,
 // similar to "json" struct tag for json.Marshal().
 //
+// You can force usage of specific encoder (google/go-querystring, ajg/form)
+// or its variation using WithQueryEncoder() method.
+//
 // Example:
 //
 //	type MyURL struct {
@@ -1174,7 +1250,17 @@ func (r *Request) WithQueryObject(object interface{}) *Request {
 		q   url.Values
 		err error
 	)
-	if reflect.Indirect(reflect.ValueOf(object)).Kind() == reflect.Struct {
+
+	encoder := r.queryEncoder
+	if encoder == defaultQueryEncoder {
+		encoder = selectQueryEncoder(object)
+	}
+
+	switch encoder {
+	case defaultQueryEncoder:
+		// can't happen
+
+	case QueryEncoderGoogle:
 		q, err = query.Values(object)
 		if err != nil {
 			opChain.fail(AssertionFailure{
@@ -1182,19 +1268,43 @@ func (r *Request) WithQueryObject(object interface{}) *Request {
 				Actual: &AssertionValue{object},
 				Errors: []error{
 					errors.New("invalid query object"),
+					errors.New("google/go-querystring encoding failed"),
 					err,
 				},
 			})
 			return r
 		}
-	} else {
-		q, err = form.EncodeToValues(object)
+
+	case QueryEncoderForm, QueryEncoderFormKeepZeros:
+		var b bytes.Buffer
+		enc := form.NewEncoder(&b)
+
+		if encoder == QueryEncoderFormKeepZeros {
+			enc.KeepZeros(true)
+		}
+
+		err = enc.Encode(object)
 		if err != nil {
 			opChain.fail(AssertionFailure{
 				Type:   AssertValid,
 				Actual: &AssertionValue{object},
 				Errors: []error{
 					errors.New("invalid query object"),
+					errors.New("ajg/form encoding failed"),
+					err,
+				},
+			})
+			return r
+		}
+
+		q, err = url.ParseQuery(b.String())
+		if err != nil {
+			opChain.fail(AssertionFailure{
+				Type:   AssertValid,
+				Actual: &AssertionValue{object},
+				Errors: []error{
+					errors.New("invalid query object"),
+					errors.New("ajg/form produced malformed query"),
 					err,
 				},
 			})
@@ -1210,6 +1320,90 @@ func (r *Request) WithQueryObject(object interface{}) *Request {
 	}
 
 	return r
+}
+
+// QueryEncoder defines how to encode object into query in WithQueryObject().
+// If not set, appropriate encoder is selected automatically:
+//   - for structs and pointer to structs, QueryEncoderGoogle is used
+//   - otherwise QueryEncoderAjg is used
+type QueryEncoder int
+
+const (
+	// indicates that WithQueryEncoder was not called
+	defaultQueryEncoder QueryEncoder = iota
+
+	// QueryEncoderGoogle encodes query using google/go-querystring package.
+	// Query object should be a struct annotated with `url` tags.
+	// See https://github.com/google/go-querystring.
+	QueryEncoderGoogle
+
+	// QueryEncoderForm encodes query using ajg/form package.
+	// Query object can be arbitrary type including maps and structs
+	// annotated with `form` tags.
+	// See https://github.com/ajg/form.
+	QueryEncoderForm
+
+	// QueryEncoderFormKeepZeros is same as QueryEncoderForm, but with KeepZeros
+	// flag enabled. With this flag, encoder keeps zero (default) values in their
+	// literal form when encoding, and returns the former; by default zero values
+	// are not kept, but are rather encoded as the empty string.
+	QueryEncoderFormKeepZeros
+)
+
+// WithQueryEncoder forces use of specific encoder or encoder mode when
+// an object is converted to query string in WithQueryObject().
+//
+// See documentation for QueryEncoder enum for evailable encoders.
+//
+// In particular, you can use it to force ajg/form encoder for structs instead
+// of google/go-querystring, or to use KeepZeros mode of the ajg/form encoder.
+//
+// Example:
+//
+//	type MyURL struct {
+//		A int    `form:"a"`
+//		B string `form:"b"`
+//	}
+//
+//	req := NewRequestC(config, "PUT", "http://example.com/path")
+//	req.WithQueryEncoder(QueryEncoderForm)
+//	req.WithQueryObject(MyURL{A: 123, B: "foo"})
+//	// URL is now http://example.com/path?a=123&b=foo
+//
+//	req := NewRequestC(config, "PUT", "http://example.com/path")
+//	req.WithQueryEncoder(QueryEncoderFormKeepZeros)
+//	req.WithQueryObject(map[string]interface{}{"a": 0, "b": 0})
+//	// URL is now http://example.com/path?a=0&b=0
+func (r *Request) WithQueryEncoder(encoder QueryEncoder) *Request {
+	opChain := r.chain.enter("WithQueryEncoder()")
+	defer opChain.leave()
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if opChain.failed() {
+		return r
+	}
+
+	if !r.checkOrder(opChain, "WithQueryEncoder()") {
+		return r
+	}
+
+	r.queryEncoder = encoder
+
+	return r
+}
+
+func selectQueryEncoder(object interface{}) QueryEncoder {
+	value := reflect.Indirect(reflect.ValueOf(object))
+
+	if value.Kind() == reflect.Struct {
+		// Use google/go-querystring.
+		return QueryEncoderGoogle
+	}
+
+	// Use ajg/form.
+	return QueryEncoderForm
 }
 
 // WithQueryString parses given query string and adds it to request URL.
@@ -1889,7 +2083,7 @@ func (r *Request) WithFile(key, path string, reader ...io.Reader) *Request {
 //
 //	req := NewRequestC(config, "PUT", "http://example.com/path")
 //	fh, _ := os.Open("./john.png")
-//	b, _ := ioutil.ReadAll(fh)
+//	b, _ := io.ReadAll(fh)
 //	req.WithMultipart().
 //		WithFileBytes("avatar", "john.png", b)
 //	fh.Close()
@@ -2006,9 +2200,9 @@ func (r *Request) WithMultipart() *Request {
 	r.setType(opChain, "WithMultipart()", "multipart/form-data", false)
 
 	if r.multipart == nil {
-		r.formbuf = &bytes.Buffer{}
-		r.multipart = r.multipartFn(r.formbuf)
-		r.setBody(opChain, "WithMultipart()", r.formbuf, 0, false)
+		r.formBuf = &bytes.Buffer{}
+		r.multipart = r.multipartFn(r.formBuf)
+		r.setBody(opChain, "WithMultipart()", r.formBuf, 0, false)
 	}
 
 	return r
@@ -2146,7 +2340,7 @@ func (r *Request) encodeRequest(opChain *chain) bool {
 		}
 
 		r.setType(opChain, "Expect()", r.multipart.FormDataContentType(), true)
-		r.setBody(opChain, "Expect()", r.formbuf, r.formbuf.Len(), true)
+		r.setBody(opChain, "Expect()", r.formBuf, r.formBuf.Len(), true)
 	} else if r.form != nil {
 		s := r.form.Encode()
 		r.setBody(opChain,
@@ -2263,7 +2457,13 @@ func (r *Request) retryRequest(reqFunc func() (*http.Response, error)) (
 			if reqBody != nil {
 				reqBody.Rewind()
 			}
-			printer.Request(r.httpReq)
+			// Make a copy to avoid accidental modification of request.
+			// In particular, httputil.DumpRequest reads sets request body into a buffer
+			// and set req.Body to a wrapper that will re-read body from buffer.
+			// It breaks our bodyWrapper logic as we don't expect that someone will
+			// replace bodyWrapper with something else.
+			httpReqCopy := *r.httpReq
+			printer.Request(&httpReqCopy)
 		}
 
 		if reqBody != nil {
@@ -2298,7 +2498,10 @@ func (r *Request) retryRequest(reqFunc func() (*http.Response, error)) (
 				if resp.Body != nil {
 					resp.Body.(*bodyWrapper).Rewind()
 				}
-				printer.Response(resp, elapsed)
+				// Make a copy to avoid accidental modification of request.
+				// See comment above.
+				httpRespCopy := *resp
+				printer.Response(&httpRespCopy, elapsed)
 			}
 		}
 
@@ -2333,6 +2536,10 @@ func (r *Request) retryRequest(reqFunc func() (*http.Response, error)) (
 }
 
 func (r *Request) shouldRetry(resp *http.Response, err error) bool {
+	if r.retryPolicyFn != nil {
+		return r.retryPolicyFn(resp, err) // set by WithRetryPolicyFunc
+	}
+
 	var (
 		isTemporaryNetworkError bool // Deprecated
 		isTimeoutError          bool
@@ -2351,7 +2558,15 @@ func (r *Request) shouldRetry(resp *http.Response, err error) bool {
 		isHTTPError = resp.StatusCode >= 400 && resp.StatusCode <= 599
 	}
 
-	switch r.retryPolicy {
+	policy := r.retryPolicy // set by WithRetryPolicy
+	if r.retryPolicy == defaultRetryPolicy {
+		policy = RetryTimeoutAndServerErrors
+	}
+
+	switch policy {
+	case defaultRetryPolicy:
+		// can't happen
+
 	case DontRetry:
 		break
 
@@ -2427,7 +2642,8 @@ func (r *Request) setupRedirects(opChain *chain) {
 			if _, ok := r.httpReq.Body.(*bodyWrapper); !ok {
 				r.httpReq.Body = newBodyWrapper(r.httpReq.Body, nil)
 			}
-			r.httpReq.GetBody = r.httpReq.Body.(*bodyWrapper).GetBody
+			wrapper := r.httpReq.Body.(*bodyWrapper)
+			r.httpReq.GetBody = wrapper.GetBody
 		} else {
 			r.httpReq.GetBody = func() (io.ReadCloser, error) {
 				return http.NoBody, nil
@@ -2475,7 +2691,7 @@ var bodyErr = `ambiguous request body contents:
   then replaced by %s`
 
 func (r *Request) setBody(
-	opChain *chain, setter string, reader io.Reader, len int, overwrite bool,
+	opChain *chain, setter string, reader io.Reader, length int, overwrite bool,
 ) {
 	if !overwrite && r.bodySetter != "" {
 		opChain.fail(AssertionFailure{
@@ -2487,7 +2703,7 @@ func (r *Request) setBody(
 		return
 	}
 
-	if len > 0 && reader == nil {
+	if length > 0 && reader == nil {
 		panic("invalid length")
 	}
 
@@ -2495,8 +2711,8 @@ func (r *Request) setBody(
 		r.httpReq.Body = http.NoBody
 		r.httpReq.ContentLength = 0
 	} else {
-		r.httpReq.Body = ioutil.NopCloser(reader)
-		r.httpReq.ContentLength = int64(len)
+		r.httpReq.Body = io.NopCloser(reader)
+		r.httpReq.ContentLength = int64(length)
 	}
 
 	r.bodySetter = setter

@@ -2,31 +2,74 @@ name: CI
 
 on:
   push:
-    branches: [master]
+    branches: [main]
   pull_request:
-    branches: [master]
+    branches: [main]
 
 permissions:
   contents: read
 
 jobs:
 
-  test:
-    name: Test
+  build:
+    name: Build
     runs-on: ubuntu-latest
 
     strategy:
       matrix:
-        go_version: [1.21.x]
+        go_version: [1.25.x, 1.26.x]
+
     steps:
 
-    - name: Set up Go 1.x
-      uses: actions/setup-go@v4
+    - name: Check out code
+      uses: actions/checkout@v4
+
+    - name: Set up Go
+      uses: actions/setup-go@v5
       with:
         go-version: ${{ matrix.go_version }}
 
-    - name: Check out code into the Go module directory
-      uses: actions/checkout@v3
+    - name: Build
+      run: go build ./...
 
-    - name: Test
-      run: go test -v ./...
+    - name: Vet
+      run: go vet ./...
+
+    - name: Gofmt
+      run: |
+        unformatted=$(gofmt -l .)
+        if [ -n "$unformatted" ]; then
+          echo "not gofmt'd:"; echo "$unformatted"; exit 1
+        fi
+
+  # This fork ships no tests, so there is nothing for `go test` to prove.
+  # What it does have are invariants, and those are worth failing a build over.
+  # See FORK.md.
+  invariants:
+    name: Fork invariants
+    runs-on: ubuntu-latest
+
+    steps:
+
+    - name: Check out code
+      uses: actions/checkout@v4
+
+    # Scoped to source and the module files. README.md and FORK.md name
+    # fasthttp on purpose, to say it is gone.
+    - name: No fasthttp
+      run: |
+        if git grep -In -i fasthttp -- '*.go' go.mod go.sum ; then
+          echo "fasthttp must not reappear in this fork - see FORK.md"; exit 1
+        fi
+
+    - name: No upstream module path
+      run: |
+        if git grep -In gavv -- '*.go' go.mod ; then
+          echo "upstream module path leaked into source - see FORK.md"; exit 1
+        fi
+
+    - name: No test files
+      run: |
+        if git ls-files --error-unmatch '*_test.go' 2>/dev/null ; then
+          echo "tests are stripped from this fork - see .fork/strip.sh"; exit 1
+        fi

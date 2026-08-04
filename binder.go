@@ -3,8 +3,7 @@ package httpexpect
 import (
 	"crypto/tls"
 	"fmt"
-	"io/ioutil"
-	"net"
+	"io"
 	"net/http"
 	"net/http/httptest"
 )
@@ -73,33 +72,8 @@ func (binder Binder) RoundTrip(origReq *http.Request) (*http.Response, error) {
 	}
 
 	if recorder.Body != nil {
-		resp.Body = ioutil.NopCloser(recorder.Body)
+		resp.Body = io.NopCloser(recorder.Body)
 	}
 
 	return &resp, nil
-}
-
-type connNonTLS struct {
-	net.Conn
-}
-
-func (connNonTLS) RemoteAddr() net.Addr {
-	return &net.TCPAddr{IP: net.IPv4zero}
-}
-
-func (connNonTLS) LocalAddr() net.Addr {
-	return &net.TCPAddr{IP: net.IPv4zero}
-}
-
-type connTLS struct {
-	connNonTLS
-	state *tls.ConnectionState
-}
-
-func (c connTLS) Handshake() error {
-	return nil
-}
-
-func (c connTLS) ConnectionState() tls.ConnectionState {
-	return *c.state
 }

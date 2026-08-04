@@ -16,6 +16,7 @@ import (
 	"testing"
 	"text/template"
 
+	"github.com/TylerBrock/colorjson"
 	"github.com/fatih/color"
 	"github.com/mattn/go-isatty"
 	"github.com/mitchellh/go-wordwrap"
@@ -1008,12 +1009,104 @@ var defaultTemplateFuncs = template.FuncMap{
 		}
 		return color.New(colorAttr).Sprint(input)
 	},
+	"colorhttp": func(enable bool, isResponse bool, input string) string {
+		if !enable {
+			return input
+		}
+
+		methodColor := color.New(defaultColors["HiMagenta"])
+		statusColor := color.New(defaultColors["HiMagenta"])
+		headerColor := color.New(defaultColors["Cyan"])
+
+		var sb strings.Builder
+
+		isFirstLine := true
+		for _, line := range strings.Split(input, "\n") {
+			if sb.Len() != 0 {
+				sb.WriteString("\n")
+			}
+
+			line = strings.TrimSuffix(line, "\n")
+			line = strings.TrimSuffix(line, "\r")
+
+			var words []string
+			if isFirstLine {
+				words = strings.SplitN(line, " ", -1)
+			} else {
+				words = strings.SplitN(line, " ", 2)
+			}
+
+			wordLen := len(words)
+			for index, word := range words {
+				var applyColor *color.Color
+
+				if isFirstLine {
+					if isResponse {
+						if index != 0 && index != wordLen-1 {
+							applyColor = statusColor
+						}
+					} else {
+						if index == 0 {
+							applyColor = methodColor
+						}
+					}
+				} else {
+					if index == 0 {
+						applyColor = headerColor
+					}
+				}
+
+				if word != "" && applyColor != nil {
+					sb.WriteString(applyColor.Sprint(word))
+				} else {
+					sb.WriteString(word)
+				}
+
+				sb.WriteString(" ")
+			}
+
+			isFirstLine = false
+		}
+
+		return sb.String()
+	},
+	"colorjson": func(enable bool, colorName, input string) string {
+		if !enable {
+			return input
+		}
+
+		fallbackColor := color.Reset
+		if attr, ok := defaultColors[colorName]; ok {
+			fallbackColor = attr
+		}
+
+		var parsedInput interface{}
+		err := json.Unmarshal([]byte(input), &parsedInput)
+		if err != nil {
+			return color.New(fallbackColor).Sprint(input)
+		}
+
+		formatter := colorjson.NewFormatter()
+		formatter.KeyColor = color.New(color.Reset)
+		formatter.StringColor = color.New(defaultColors["HiMagenta"])
+		formatter.NumberColor = color.New(defaultColors["Cyan"])
+		formatter.BoolColor = color.New(defaultColors["Cyan"])
+		formatter.NullColor = color.New(defaultColors["Cyan"])
+		formatter.Indent = 2
+
+		b, err := formatter.Marshal(parsedInput)
+		if err != nil {
+			return color.New(fallbackColor).Sprint(input)
+		}
+
+		return string(b)
+	},
 	"colordiff": func(enable bool, input string) string {
 		if !enable {
 			return input
 		}
 
-		prefixColor := []struct {
+		prefixColor := [...]struct {
 			prefix string
 			color  color.Attribute
 		}{
@@ -1066,11 +1159,11 @@ request name: {{ .RequestName | color $.EnableColors "Cyan" }}
 {{- end -}}
 {{- if .HaveRequest }}
 
-request: {{ .Request | indent | trim | color $.EnableColors "HiMagenta" }}
+request: {{ .Request | colorhttp $.EnableColors false | indent | trim }}
 {{- end -}}
 {{- if .HaveResponse }}
 
-response: {{ .Response | indent | trim | color $.EnableColors "HiMagenta" }}
+response: {{ .Response | colorhttp $.EnableColors true | indent | trim }}
 {{- end -}}
 {{- if .HaveStacktrace }}
 
@@ -1091,23 +1184,23 @@ assertion:
 {{- else }}expected
 {{- end }} {{ .ExpectedKind }}:
 {{- range $n, $exp := .Expected }}
-{{ $exp | indent | color $.EnableColors "HiMagenta" }}
+{{ $exp | colorjson $.EnableColors "HiMagenta" | indent }}
 {{- end -}}
 {{- end -}}
 {{- if .HaveActual }}
 
 actual value:
-{{ .Actual | indent | color .EnableColors "HiMagenta" }}
+{{ .Actual | colorjson .EnableColors "HiMagenta" | indent }}
 {{- end -}}
 {{- if .HaveReference }}
 
 reference value:
-{{ .Reference | indent | color .EnableColors "HiMagenta" }}
+{{ .Reference | colorjson .EnableColors "HiMagenta" | indent }}
 {{- end -}}
 {{- if .HaveDelta }}
 
 allowed delta:
-{{ .Delta | indent | color .EnableColors "HiMagenta" }}
+{{ .Delta | indent | color .EnableColors "Cyan" }}
 {{- end -}}
 {{- if .HaveDiff }}
 

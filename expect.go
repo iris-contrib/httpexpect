@@ -3,7 +3,7 @@
 // # Usage examples
 //
 // See example directory:
-//   - https://github.com/kataras/iris/tree/master/_examples
+//   - https://github.com/kataras/iris/tree/main/_examples/12-testing
 //
 // # Communication mode
 //
@@ -309,7 +309,7 @@ func (f RequestFactoryFunc) NewRequest(
 // Client is used to send http.Request and receive http.Response.
 // http.Client implements this interface.
 //
-// Binder and FastBinder may be used to obtain this interface implementation.
+// Binder may be used to obtain this interface implementation.
 //
 // Example:
 //
